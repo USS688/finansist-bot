@@ -1,9 +1,10 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
 import pytz
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import OpenAI
@@ -30,8 +31,7 @@ def get_sheet(sheet_name):
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    return spreadsheet.worksheet(sheet_name)
+    return client.open_by_key(SPREADSHEET_ID).worksheet(sheet_name)
 
 def add_transaction(rows: list):
     sheet = get_sheet("Транзакции")
@@ -97,7 +97,7 @@ Extract financial data and return ONLY a JSON array. No explanation, no markdown
 If ONE transaction:
 [{"тип":"расход","сумма":15000,"категория":"транспорт","описание":"такси"}]
 
-If MULTIPLE transactions (list, one per line):
+If MULTIPLE transactions:
 [{"тип":"расход","сумма":8000,"категория":"еда","описание":"молоко"},{"тип":"расход","сумма":45000,"категория":"еда","описание":"мясо"}]
 
 Types: расход, доход, долг
@@ -132,15 +132,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text.lower() in ["итоги", "итог", "статистика", "отчёт", "отчет"]:
-        await send_stats(update, context)
+        await send_stats(update)
         return
 
     if text.lower() in ["долги", "долг"]:
-        await send_debts(update, context)
+        await send_debts(update)
         return
 
     if text.lower() in ["помощь", "help", "/help", "/start"]:
-        await send_help(update, context)
+        await send_help(update)
         return
 
     try:
@@ -162,7 +162,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error: {e}")
         await update.message.reply_text("❌ Не смог разобрать. Попробуй:\nтакси 15000\nили список:\nмолоко 8000\nмясо 45000")
 
-async def send_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_stats(update: Update):
     try:
         stats = get_month_stats()
         cat_lines = ""
@@ -187,7 +187,7 @@ async def send_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Stats error: {e}")
         await update.message.reply_text("❌ Не удалось получить статистику.")
 
-async def send_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_debts(update: Update):
     try:
         sheet = get_sheet("Транзакции")
         records = sheet.get_all_records()
@@ -228,7 +228,7 @@ async def send_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Debts error: {e}")
         await update.message.reply_text("❌ Не удалось получить список долгов.")
 
-async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_help(update: Update):
     msg = """👋 Привет! Я твой финансовый бот.
 
 Как записывать:
@@ -237,7 +237,7 @@ async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • одолжил Алишеру 100000 — долг
 • вернул Темур 50000 — возврат
 
-Список (несколько строк):
+Список с базара:
 молоко 8000
 мясо 45000
 хлеб 3000
@@ -249,33 +249,37 @@ async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 # --- НАПОМИНАНИЕ ---
-async def send_reminder(bot):
+async def send_reminder():
+    bot = Bot(token=TELEGRAM_TOKEN)
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
     msg = f"👋 Привет Стас!\n\nУже {now.strftime('%H:%M')}. Не забудь записать расходы за сегодня 📝"
     await bot.send_message(chat_id=MY_CHAT_ID, text=msg)
 
 # --- ЗАПУСК ---
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+async def main():
+    # Напоминание в 22:00 Ташкент = 17:00 UTC
+    scheduler = AsyncIOScheduler(timezone=pytz.utc)
+    scheduler.add_job(send_reminder, "cron", hour=17, minute=0)
+    scheduler.start()
 
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_message))
     app.add_handler(CommandHandler("help", handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Напоминание в 22:00 Ташкент = 17:00 UTC
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        send_reminder,
-        "cron",
-        hour=17,
-        minute=0,
-        args=[app.bot]
-    )
-    scheduler.start()
-
     logger.info("Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    # Держим бота живым
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
